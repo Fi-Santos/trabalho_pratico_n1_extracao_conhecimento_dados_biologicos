@@ -1,0 +1,922 @@
+---
+title: "Trabalho de ECDB G6"
+author: "Alice Picas PG59750, Eduarda Santos PG58815, Pedro Vieira PG59764, Pedro Fontão PG59429"
+date: "2026-04-02"
+output: html_document
+html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true     
+    code_folding: hide    
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+---
+
+
+
+# Instalação e Carregamento de Packages
+
+```{r pacotes, message=FALSE, warning=FALSE}
+#if (!requireNamespace("msigdbr", quietly = TRUE))
+#    install.packages("msigdbr")
+
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+
+BiocManager::install(c("TCGAbiolinks", "edgeR", "SummarizedExperiment", "fgsea","DESeq2"))
+library(TCGAbiolinks)
+library(edgeR)
+library(SummarizedExperiment)
+library(ggplot2)
+library(pheatmap)
+library(DESeq2)
+library(RColorBrewer)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(fgsea)
+library(msigdbr)
+```
+
+
+# Explicação dos dados, origem e sua relevância
+
+O conjunto de dados selecionado é o TCGA-BRCA (Breast Invasive Carcinoma), cujos dados foram obtidos através do portal de análise do Genomic Data Commons (GDC). Este projeto é parte integrante do consórcio The Cancer Genome Atlas (TCGA) e foca-se na caraterização molecular profunda do carcinoma invasivo da mama. Este programa histórico de genómica do cancro, entre 2006 e 2018, caracterizou molecularmente mais de 20.000 amostras de cancro primário e controlos emparelhados em 33 tipos de cancro. No caso específico do cancro da mama. No caso do BRCA, a análise detalhada destes dados permitiu demonstrar a existência de quatro classes biológicas principais — Luminal A, Luminal B, HER2-enriched e Basal-like — cada uma apresentando uma heterogeneidade molecular significativa. Esta reclassificação é crucial pois identifica aberrações genómicas que podem ser alvo de terapias específicas, permitindo uma transição para a medicina de precisão.
+
+
+
+---
+
+# Pré-processamento de dados
+
+---
+
+## Download dos Dados de Expressão
+
+```{r download, eval=FALSE}
+query <- GDCquery(
+  project       = "TCGA-BRCA",
+  data.category = "Transcriptome Profiling",
+  data.type     = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  sample.type   = c("Primary Tumor", "Solid Tissue Normal")
+)
+
+resultados <- getResults(query)
+cat("Total de amostras disponiveis:", nrow(resultados), "\n")
+
+set.seed(42)
+idx_sub        <- sample(1:nrow(resultados), 300)
+resultados_sub <- resultados[idx_sub, ]
+
+query_sub <- GDCquery(
+  project       = "TCGA-BRCA",
+  data.category = "Transcriptome Profiling",
+  data.type     = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  sample.type   = c("Primary Tumor", "Solid Tissue Normal"),
+  barcode       = resultados_sub$cases
+)
+
+
+GDCdownload(query_sub, files.per.chunk = 10)
+data_tcga <- GDCprepare(query_sub)
+
+saveRDS(data_tcga, "data_tcga_brca_300.rds")
+```
+
+```{r carregar-rds}
+data_tcga <- readRDS("data_tcga_brca_300.rds")
+cat("Amostras carregadas:", ncol(data_tcga), "\n")
+cat("Genes:              ", nrow(data_tcga), "\n")
+```
+
+---
+
+## Carregamento dos Metadados Clinicos
+
+```{r carregar-clinicos}
+# O valor "'--" representa dados omissos no TCGA -> converter para NA
+clinical    <- read.delim("clinical.tsv",         sep = "\t", na.strings = c("'--", "--"))
+pathology   <- read.delim("pathology_detail.tsv", sep = "\t", na.strings = c("'--", "--"))
+follow_up   <- read.delim("follow_up.tsv",        sep = "\t", na.strings = c("'--", "--"))
+exposure    <- read.delim("exposure.tsv",         sep = "\t", na.strings = c("'--", "--"))
+family_hist <- read.delim("family_history.tsv",   sep = "\t", na.strings = c("'--", "--"))
+
+cat("clinical (antes):    ", nrow(clinical),    "linhas x", ncol(clinical),    "colunas\n")
+cat("pathology:           ", nrow(pathology),   "linhas x", ncol(pathology),   "colunas\n")
+cat("follow_up:           ", nrow(follow_up),   "linhas x", ncol(follow_up),   "colunas\n")
+cat("exposure:            ", nrow(exposure),    "linhas x", ncol(exposure),    "colunas\n")
+cat("family_hist:         ", nrow(family_hist), "linhas x", ncol(family_hist), "colunas\n")
+
+# Remover linhas duplicadas por paciente
+# (o clinical.tsv tem multiplas linhas por paciente devido aos tratamentos)
+clinical <- clinical[!duplicated(clinical$cases.submitter_id), ]
+cat("\nclinical (apos remocao duplicados):", nrow(clinical), "amostras unicas\n")
+```
+
+---
+
+## Verificacao da Estrutura dos Dados
+
+```{r verificar-estrutura}
+cat("Genes:    ", nrow(data_tcga), "\n")
+cat("Amostras: ", ncol(data_tcga), "\n")
+
+# Classes dos campos dos metadados clinicos
+unlist(lapply(clinical[, 1:15], class))
+
+# Primeiros registos
+head(clinical[, 1:10])
+
+# Nomes dos campos
+names(clinical)[1:20]
+
+# Tipos de amostra disponíveis
+meta <- colData(data_tcga)
+print(table(meta$sample_type))
+```
+
+---
+
+## Tratamento de Valores Omissos
+
+```{r valores-omissos}
+# Contagem de NAs por coluna nos metadados clinicos
+na_counts         <- sapply(clinical, function(x) sum(is.na(x)))
+na_counts_nonzero <- na_counts[na_counts > 0]
+
+cat("Colunas com valores omissos:", length(na_counts_nonzero), "\n")
+head(sort(na_counts_nonzero, decreasing = TRUE), 20)
+
+cat("\nLinhas sem NAs (complete cases):", sum(complete.cases(clinical)), "\n")
+cat("Total de linhas:               ", nrow(clinical), "\n")
+
+# NAs na matriz de contagens
+counts_raw <- assay(data_tcga, "unstranded")
+cat("\nNAs na matriz de contagens:", sum(is.na(counts_raw)), "\n")
+```
+
+---
+
+## Filtragem de Genes com Expressao Baixa
+
+```{r filtragem}
+counts_raw <- assay(data_tcga, "unstranded")
+
+# Calcular CPM
+myCPM <- cpm(counts_raw)
+
+# Criterio: CPM > 0.5 em pelo menos 2 amostras
+thresh          <- myCPM > 0.5
+keep            <- rowSums(thresh) >= 2
+counts_filtered <- counts_raw[keep, ]
+
+cat("Genes antes da filtragem: ", nrow(counts_raw), "\n")
+cat("Genes apos filtragem:     ", nrow(counts_filtered), "\n")
+cat("Genes removidos:          ", nrow(counts_raw) - nrow(counts_filtered), "\n")
+summary(keep)
+```
+
+---
+
+## Normalizacao (TMM) e Standardizacao
+
+```{r normalizacao}
+# Criar objeto DGEList
+dgeObj <- DGEList(counts_filtered)
+
+# Calcular factores de normalizacao TMM (corrige composition bias)
+dgeObj <- calcNormFactors(dgeObj)
+
+# Verificar factores
+head(dgeObj$samples)
+
+# Gerar log-CPM normalizado
+logcounts <- cpm(dgeObj, log = TRUE)
+cat("Dimensoes logCPM normalizado:", dim(logcounts), "\n")
+
+# Standardizacao (z-score por gene)
+# Subtrai a media e divide pelo desvio padrao de cada gene
+logcounts_scaled <- t(scale(t(logcounts)))
+
+cat("Media apos standardizacao (esperado ~0):  ", round(mean(logcounts_scaled), 4), "\n")
+cat("DesvPad apos standardizacao (esperado ~1):", round(sd(logcounts_scaled), 4), "\n")
+```
+
+---
+
+## Exportar Dados Processados
+
+```{r exportar}
+if (exists("counts_filtered")) {
+  write.csv(as.data.frame(counts_filtered), file = "counts_filtered.csv")
+  cat("counts_filtered.csv exportado\n")
+}
+
+if (exists("logcounts")) {
+  write.csv(as.data.frame(logcounts), file = "logcounts_normalized.csv")
+  cat("logcounts_normalized.csv exportado\n")
+}
+
+if (exists("logcounts_scaled")) {
+  write.csv(as.data.frame(logcounts_scaled), file = "logcounts_scaled.csv")
+  cat("logcounts_scaled.csv exportado\n")
+}
+
+if (exists("clinical")) {
+  write.csv(clinical, file = "clinical_processed.csv")
+  cat("clinical_processed.csv exportado\n")
+}
+```
+
+
+
+```{r Carregar dados, eval=FALSE}
+# sumarização + expressão diferencial
+logcounts        <- read.csv("logcounts_normalized.csv", row.names = 1)
+counts_filtered  <- read.csv("counts_filtered.csv", row.names = 1)
+clinical         <- read.csv("clinical_processed.csv", row.names = 1)
+
+# clustering + redução de dimensionalidade
+logcounts_scaled <- read.csv("logcounts_scaled.csv", row.names = 1)
+clinical         <- read.csv("clinical_processed.csv", row.names = 1)
+
+#Machine learning
+logcounts        <- read.csv("logcounts_normalized.csv", row.names = 1)
+clinical         <- read.csv("clinical_processed.csv", row.names = 1)
+```
+
+# Sumarisação dos Dados
+
+## Verificar o nome dos campos
+```{r Verificar o nome dos campos}
+cat("Verificar o nome dos campos\n\n")
+cat("logcounts:\n")
+names(logcounts)
+
+cat("\n\ncounts_filtered:\n")
+names(counts_filtered)
+
+cat("\n\nclinical:\n")
+names(clinical)
+
+cat("\n\nlogcounts_scaled:\n")
+names(logcounts_scaled)
+```
+
+## Verificar dimensões dos dados
+```{r Verificar dimensões dos dados}
+
+cat("Verificar dimensões dos dados\n\n")
+cat("logcounts:\n")
+dim(logcounts)
+
+cat("\ncounts_filtered:\n")
+dim(counts_filtered)
+
+cat("\nclinical:\n")
+dim(clinical)
+
+cat("\nlogcounts_scaled:\n")
+dim(logcounts_scaled)
+```
+
+## Verificar estrutura dos dados
+```{r Verificar estrutura dos dados}
+
+cat("Verificar estrutura dos dados\n\n")
+cat("logcounts:\n")
+#sapply(logcounts, class)
+str(logcounts)
+
+
+cat("\ncounts_filtered:\n")
+#sapply(counts_filtered, class)
+str(counts_filtered)
+
+
+cat("\nclinical:\n")
+#sapply(clinical, class)
+str(clinical)
+
+
+cat("\nlogcounts_scaled:\n")
+#sapply(logcounts_scaled, class)
+str(logcounts_scaled)
+
+```
+
+# Analise das Dados
+
+As três variáveis "counts_filtered", "logcounts" e "logcounts_scaled" não tiveram uma estatística descritiva convencional (sumário e desvio padrão), pois contêm milhares de genes. A apresentação de média, mediana ou desvio padrão para cada gene individual não seria informativa nem legível neste relatório. Em vez disso, procedeu-se à visualização global da distribuição de expressão e análise dos genes expressos.
+
+
+## counts_filtered
+
+Os dados em counts_filtered não passaram por qualquer transformação, a qual é essencial para permitir uma análise adequada da expressão gênica. Por isso, a análise direta destes dados é pouco informativa e não foi realizada
+
+## Logcounts
+
+```{r Logcounts - Histograma}
+hist(as.numeric(as.matrix(logcounts)),
+     breaks=100,
+     col="lightblue",
+     main="Distribuição global da expressão dos genes",
+     xlab="Logcounts")
+```
+
+```{r Preparação}
+# calcular média por gene
+medias_log_genes <- rowMeans(logcounts)
+medias_log_genes_df <- data.frame(
+  Gene = names(medias_log_genes),
+  MeanExpression = medias_log_genes
+)
+```
+
+```{r Logcounts - Genes Mais Expressos}
+Logcounts_top10 <- medias_log_genes_df[order(-medias_log_genes_df$MeanExpression), ][1:10, ]
+
+ggplot(Logcounts_top10, aes(x=reorder(Gene, MeanExpression), y=MeanExpression)) +
+  geom_bar(stat="identity", fill="lightgreen") +
+  coord_flip() +
+  theme_minimal() +
+  ylab("Média de expressão (logcounts)") +
+  xlab("Gene") +
+  ggtitle("Top 10 genes mais expressos")
+```
+
+```{r Logcounts - Heatmaps Genes Mais Expressos}
+Logcounts_top_genes <- names(sort(rowMeans(logcounts), decreasing = TRUE))[1:10]
+
+pheatmap(logcounts[Logcounts_top_genes, ],
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         main = "Top 10 genes mais expressos")
+```
+
+```{r Logcounts - Genes Menos Expressos}
+Logcounts_bottom10 <- medias_log_genes_df[order(medias_log_genes_df$MeanExpression), ][1:10, ]
+
+ggplot(Logcounts_bottom10, aes(x=reorder(Gene, MeanExpression), y=MeanExpression)) +
+  geom_bar(stat="identity", fill="red") +
+  coord_flip() +
+  theme_minimal() +
+  ylab("Média de expressão (logcounts)") +
+  xlab("Gene") +
+  ggtitle("Top 10 genes menos expressos")
+```
+
+```{r Logcounts - Heatmaps Genes Menos Expressos}
+Logcounts_bottom_genes <- names(sort(rowMeans(logcounts), decreasing = FALSE))[1:10]
+
+pheatmap(logcounts[Logcounts_bottom_genes, ],
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         main = "Top 10 genes menos expressos")
+```
+
+```{r Logcounts - Variabilidade por gene}
+# Variabilidade por gene
+gene_sd <- apply(logcounts, 1, sd)
+
+gene_sd_df <- data.frame(
+  Gene = names(gene_sd),
+  Variability = gene_sd
+)
+```
+
+```{r Logcounts - Genes que mais variam entre amostras}
+top10_var <- gene_sd_df[order(-gene_sd_df$Variability), ][1:10, ]
+
+ggplot(top10_var, aes(x=reorder(Gene, Variability), y=Variability)) +
+  geom_bar(stat="identity", fill="lightgreen") +
+  coord_flip() +
+  theme_minimal() +
+  ylab("Variabilidade (SD)") +
+  xlab("Gene") +
+  ggtitle("Top 10 genes mais variáveis")
+```
+
+```{r Logcounts - Genes que menos variam entre amostras}
+bottom10_var <- gene_sd_df[order(gene_sd_df$Variability), ][1:10, ]
+
+ggplot(bottom10_var, aes(x=reorder(Gene, Variability), y=Variability)) +
+  geom_bar(stat="identity", fill="red") +
+  coord_flip() +
+  theme_minimal() +
+  ylab("Variabilidade (SD)") +
+  xlab("Gene") +
+  ggtitle("Top 10 genes menos variáveis")
+```
+
+## logcounts_scaled
+
+```{r logcounts_scaled - Histograma}
+hist(as.numeric(as.matrix(logcounts_scaled)),
+     breaks=100,
+     col="lightblue",
+     main="Distribuição dos logcounts scaled",
+     xlab="Valores normalizados de expressão génica",
+     xlim=c(-6, 6))
+```
+
+```{r logcounts_scaled - Comportamento entre amostrasmais variaveis}
+# Como os genes mais variaveis se comportam entre as amostras
+# Quais os genes mais variaveis
+top_genes_var <- names(sort(apply(logcounts, 1, var), decreasing = TRUE))[1:10]
+
+# heatmap dos genes mais variaveis
+pheatmap(logcounts_scaled[top_genes_var, ],
+         scale = "none",
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         main = "Heatmap de padrões relativos (logcounts_scaled)")
+```
+
+```{r logcounts_scaled - Comportamento entre menos variaveis amostras}
+# Como os genes menos variaveis se comportam entre as amostras
+# Quais os genes menos variaveis
+Bottom_genes_var <- names(sort(apply(logcounts, 1, var), decreasing = FALSE))[1:10]
+
+# heatmap dos genes menos variaveis
+pheatmap(logcounts_scaled[Bottom_genes_var, ],
+         scale = "none",
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         main = "Heatmap de padrões relativos (logcounts_scaled)")
+
+```
+
+## Clinical
+
+### estatística descritiva
+```{r Clinical - Obter Subconjunto}
+col_excluir <- c("cases.case_id", "cases.submitter_id", "demographic.demographic_id", "demographic.submitter_id", "diagnoses.diagnosis_id", "diagnoses.submitter_id", "diagnoses.tumor_of_origin", "treatments.submitter_id", "treatments.treatment_id")
+
+clinical_sub <- clinical[, !(names(clinical) %in% col_excluir)]
+```
+
+```{r Clinical - Dimenção e Nome das Colunas}
+cat("Dimenção de Clinical")
+dim(clinical_sub)
+```
+
+```{r Clinical - Colunas Numéricas, results='hide'}
+# Identificar colunas numéricas
+numericas <- sapply(clinical_sub, is.numeric)
+
+# Sumário das colunas numéricas
+cat("Sumário das colunas numéricas")
+summary(clinical_sub[, numericas])
+
+# Desvio Padrão das colunas numéricas
+cat("Desvio Padrão das colunas numéricas")
+sapply(clinical_sub[, numericas], sd, na.rm = TRUE)
+```
+
+```{r Clinical - Colunas Categóricas}
+# Tabelas das colunas categóricas
+categoricas <- !numericas
+cat("Tabelas das colunas categóricas")
+lapply(clinical_sub[, categoricas], table)
+```
+
+### Exploração
+```{r  Clinical - Idade}
+
+ggplot(clinical, aes(x = demographic.age_at_index)) +
+  geom_histogram(binwidth = 5, fill = "lightblue", color = "black") +
+  labs(x = "Idade ao índice",
+       y = "Número de casos",
+       title = "Distribuição da idade ao índice") +
+  theme_minimal()
+```
+
+```{r  Clinical - Genero}
+ggplot(clinical, aes(x = demographic.gender, fill = demographic.gender)) +
+  geom_bar() +
+  labs(x = "Género", y = "Número de casos", title = "Número de casos por género") +
+  scale_fill_manual(values = c("lightblue", "red")) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r  Clinical - Idade x Genero}
+boxplot(demographic.age_at_index ~ demographic.gender,
+        data=clinical,
+        col=c("lightblue","red"),
+        ylab="Idade ao índice",
+        xlab="Género",
+        main="Distribuição da idade ao índice por género")
+```
+
+```{r  Clinical - Idade x Estado Vital}
+ggplot(clinical, aes(x = demographic.age_at_index, fill = demographic.vital_status)) +
+  geom_bar(position = "dodge") +
+  labs(
+    x = "Género",
+    y = "Número de casos",
+    fill = "Estado vital",
+    title = "Sobrevivência por género"
+  ) +
+  scale_fill_manual(values = c("lightblue", "red")) +
+  theme_minimal()
+```
+
+```{r  Clinical - Genero x Estado Vital}
+
+ggplot(clinical, aes(x = demographic.gender, fill = demographic.vital_status)) +
+  geom_bar(position = "dodge") +
+  labs(
+    x = "Género",
+    y = "Número de casos",
+    fill = "Estado vital",
+    title = "Sobrevivência por género"
+  ) +
+  scale_fill_manual(values = c("lightblue", "red")) +
+  theme_minimal()
+```
+
+```{r  Clinical - Tipo de Cancro x Genero}
+ggplot(clinical, aes(x = cases.disease_type, fill = demographic.gender)) +
+  geom_bar(position = "dodge") + 
+  labs(x = "Tipo de doença",
+       y = "Número de casos",
+       fill = "Género",
+       title = "Distribuição do tipo de doença por género") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r Clinical - Idade x Tipo de Cancro}
+boxplot(demographic.age_at_index ~ cases.disease_type,
+        data = clinical,
+        col = "lightblue",
+        ylab = "Idade ao índice",
+        xlab = "Tipo de doença",
+        main = "Distribuição da idade por tipo de doença",
+        las = 2) 
+```
+
+```{r  Clinical - Tipo de Cancro x Lateralidade}
+ggplot(clinical, aes(x = cases.disease_type, fill = diagnoses.laterality)) +
+  geom_bar(position = "dodge") +
+  labs(
+    x = "Tipo de doença",
+    y = "Número de casos",
+    fill = "Laterality",
+    title = "Distribuição dos tumores por tipo e laterality"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r  Clinical - Tipo de Cancro x Estado Vital}
+ggplot(clinical, aes(x = cases.disease_type, fill = demographic.vital_status)) +
+  geom_bar(position = "dodge") +
+  labs(x = "Tipo de doença",
+       y = "Número de casos",
+       fill = "Estado vital",
+       title = "Distribuição do tipo de doença por estado vital") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r  Clinical - Classificação do tumor x Estado Vital}
+ggplot(clinical, aes(x = diagnoses.classification_of_tumor, fill = demographic.vital_status)) +
+  geom_bar(position = "dodge") +
+  labs(x = "Classificação do tumor",
+       y = "Número de casos",
+       fill = "Estado vital",
+       title = "Distribuição da classificação do tumor por estado vital") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r  Clinical - Tratamento x Estado Vital}
+ggplot(clinical, aes(x = treatments.treatment_type, fill = demographic.vital_status)) +
+  geom_bar(position = "dodge") +
+  labs(x = "Tipo de tratamento",
+       y = "Número de casos",
+       fill = "Estado vital",
+       title = "Distribuição do tipo de tratamento por estado vital") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Análise Estatística Univariada
+
+```{r Clinical - Teste de Normalidade da Idade} 
+cat("Teste de Normalidade (idade):\n")
+
+shapiro_res <- shapiro.test(clinical$demographic.age_at_index)
+print(shapiro_res)
+
+if (shapiro_res$p.value > 0.05) {
+  cat("Distribuição aproximadamente normal (p > 0.05)\n")
+} else {
+  cat("Distribuição não normal (p <= 0.05)\n")
+}
+```
+
+
+```{r Clinical - Idade vs Estado Vital}
+cat("\nComparação da idade entre estados vitais (alive vs dead)\n")
+
+test_res <- wilcox.test(
+  demographic.age_at_index ~ demographic.vital_status,
+  data = clinical
+)
+print(test_res)
+
+
+if (test_res$p.value < 0.05) {
+  cat("Diferença significativa de idade entre os estados vitais (p <= 0.05)\n")
+} else {
+  cat("Sem diferença significativa de idade entre os estados vitais (p > 0.05)\n")
+}
+```
+
+
+```{r Clinical - Idade vs Tipo de Doenca}
+cat("\nANOVA: comparação da idade entre diferentes tipos de doença\n")
+
+anova_res <- anova(
+  lm(demographic.age_at_index ~ cases.disease_type, data = clinical)
+)
+print(anova_res)
+
+
+p_val <- anova_res$`Pr(>F)`[1]
+
+if (p_val < 0.05) {
+  cat("Pelo menos um tipo de doença apresenta uma diferença significativa na idade (p <= 0.05)\n")
+} else {
+  cat("Não há diferença significativa de idade entre os tipos de doença (p > 0.05)\n")
+}
+
+tukey_res <- TukeyHSD(aov(demographic.age_at_index ~ cases.disease_type, data = clinical))
+print(tukey_res)
+
+```
+
+
+
+# Análise da Expressão Diferencial
+
+```{r Gene Expression - Differential Expression DESeq}
+
+# Criar objeto DESeq2
+colData_fixed <- colData(data_tcga)
+colData_fixed$sample_type <- factor(colData_fixed$sample_type,
+                                    levels = c("Primary Tumor", "Solid Tissue Normal"),
+                                    labels = c("Primary_Tumor", "Solid_Tissue_Normal"))
+
+dds <- DESeqDataSetFromMatrix(
+  countData = assay(data_tcga),
+  colData = colData_fixed,
+  design = ~ sample_type
+)
+
+# Filtragem genes de baixa expressão
+dds <- dds[rowSums(counts(dds)) > 10, ]
+
+# DESeq2
+dds <- DESeq(dds, quiet = TRUE)
+
+
+# Comparação dos dois primeiros grupos
+res <- results(
+  dds,
+  contrast = c(
+    "sample_type",
+    levels(dds$sample_type)[2],
+    levels(dds$sample_type)[1]
+  )
+)
+
+# Ajuste para testes múltiplos 
+res$padj <- p.adjust(res$pvalue, method = "BH")
+
+# Genes significativos
+sig_genes <- subset(res, padj < 0.05)
+
+cat("\nNúmero de genes diferencialmente expressos:", nrow(sig_genes), "\n")
+```
+
+
+```{r Gene Expression - MA Plot}
+
+# MA plot com todos os genes
+plotMA(res, main = "MA Plot - Todos os genes", ylim = c(-5, 5))
+
+# MA plot com os genes significativos (padj < 0.05)
+plotMA(res, main = "MA Plot - Genes significativos", ylim = c(-5, 5), alpha = 0.05)
+```
+
+
+```{r Gene Expression - Differential Expression}
+
+top_genes <- head(sig_genes[order(-abs(sig_genes$log2FoldChange)), ], 50)
+top_counts <- counts(dds, normalized = TRUE)[rownames(top_genes), ]
+
+top_counts_scaled <- t(scale(t(top_counts)))
+
+pheatmap(
+  top_counts_scaled,
+  scale = "none",
+  show_rownames = FALSE,      
+  show_colnames = FALSE,     
+  main = "Heatmap dos Top 50 Genes DE",
+  border_color = NA
+)
+```
+
+
+```{r Gene Expression - Differential Expression edgeR}
+
+# Criar o objeto DGEList
+dge <- DGEList(counts = assay(data_tcga), group = colData(data_tcga)$sample_type)
+
+# Filtragem dos genes de baixa expressão
+keep <- filterByExpr(dge)
+dge <- dge[keep,, keep.lib.sizes=FALSE]
+
+dge <- calcNormFactors(dge)
+dge <- estimateDisp(dge)
+
+# Modelo e teste da expressão diferencial (Tumor vs Normal)
+fit <- glmQLFit(dge)
+res <- glmQLFTest(fit, coef=2)  # coef=2 compara o segundo nível vs primeiro nível do group
+
+# Seleção dos genes significativos (FDR < 0.05)
+sig_genes <- topTags(res, n = Inf)$table
+sig_genes <- sig_genes[sig_genes$FDR < 0.05, ]
+cat("Número de genes diferencialmente expressos:", nrow(sig_genes), "\n")
+
+```
+
+
+```{r Gene Expression - Heatmap Top Genes}
+
+top_genes <- head(sig_genes[order(-abs(sig_genes$logFC)), ], 50)
+top_counts <- cpm(dge, log=TRUE)[rownames(top_genes), ]  # log-CPM
+
+top_counts_scaled <- t(scale(t(top_counts)))
+annotation_col <- data.frame(SampleType = colData(data_tcga)$sample_type)
+rownames(annotation_col) <- colnames(top_counts_scaled)
+
+
+# Heatmap 
+pheatmap(
+  top_counts_scaled,
+  scale = "none",
+  show_rownames = FALSE,      
+  show_colnames = FALSE,    
+  annotation_col = annotation_col,
+  main = "Heatmap dos Top 50 Genes DE",
+  border_color = NA
+)
+```
+
+
+```{r Gene Expression - Boxplot Top Genes}
+
+# Normalização TMM 
+logcounts_norm <- cpm(dgeObj, log = TRUE)
+
+gene_var <- apply(logcounts_norm, 1, var)
+
+# 10 genes mais variáveis
+top10_genes <- names(sort(gene_var, decreasing = TRUE))[1:10]
+logcounts_top10 <- logcounts_norm[top10_genes, ]
+
+
+logcounts_top10_t <- t(logcounts_top10)
+
+# Boxplot 
+boxplot(
+  logcounts_top10_t,
+  xlab = "",
+  ylab = "Log2 CPM (TMM normalized)",
+  las = 2,                     
+  main = "Boxplots dos Top 10 Genes mais Variáveis",
+  col = "lightblue"
+)
+
+
+abline(h = median(logcounts_top10_t), col = "red")
+```
+
+
+```{r Gene Expression - TMM Normalization & MA Plot}
+counts_matrix <- counts(dds, normalized = FALSE)  
+group_var <- colData(dds)$sample_type         
+
+# Objeto DGEList
+dgeObj <- DGEList(counts = counts_matrix, group = group_var)
+
+# Filtragem dos genes pouco expressos 
+keep <- rowSums(cpm(dgeObj) > 1) >= 2
+dgeObj <- dgeObj[keep, , keep.lib.sizes = FALSE]
+print(dgeObj$samples)
+
+
+# Normalização TMM (composition bias)
+dgeObj <- calcNormFactors(dgeObj)
+print(dgeObj$samples)
+
+# logCPM
+logcounts <- cpm(dgeObj, log=TRUE)
+
+
+plotMD(logcounts, column = 7, main = "MA Plot (logCPM)")
+abline(h = 0, col = "grey", lwd = 2)
+
+plotMD(dgeObj, column = 7, main = "MA Plot (DGEList)")
+abline(h = 0, col = "grey", lwd = 2)
+```
+
+# Anotação
+
+```{r Gene Expression - Annotation}
+
+
+genes <- rownames(sig_genes)
+genes_clean <- gsub("\\..*", "", genes)
+genes_clean <- genes_clean[!is.na(genes_clean)]
+
+
+# Anotação
+ann <- select(
+  org.Hs.eg.db,
+  keys = genes_clean,
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL", "GENENAME", "ENTREZID")
+)
+
+
+ann <- ann[!duplicated(ann$ENSEMBL), ]
+ann <- ann[match(genes_clean, ann$ENSEMBL), ]
+
+
+results_annotated <- cbind(sig_genes, ann)
+
+head(results_annotated)
+
+```
+
+# Análise do Enriquecimento
+
+```{r Gene Expression - Enriquecimento}
+
+# Pathways 
+msig <- msigdbr(species = "Homo sapiens", collection = "H")
+pathways <- split(msig$gene_symbol, msig$gs_name)
+
+
+if ("log2FoldChange" %in% colnames(results_annotated)) {
+  fc <- results_annotated$log2FoldChange
+} else {
+  fc <- results_annotated$logFC
+}
+
+
+df <- data.frame(
+  gene = results_annotated$SYMBOL,
+  fc = fc
+)
+
+df <- df[!is.na(df$gene), ]         
+df <- df[!duplicated(df$gene), ]       
+
+
+
+
+ranks <- df$fc
+names(ranks) <- df$gene
+ranks <- sort(ranks, decreasing = TRUE)
+
+# FGSEA
+fgseaRes <- fgsea(
+  pathways = pathways,
+  stats = ranks,
+  minSize = 15,
+  maxSize = 500
+)
+
+fgseaRes <- fgseaRes[order(fgseaRes$padj), ]
+
+
+head(fgseaRes)
+```

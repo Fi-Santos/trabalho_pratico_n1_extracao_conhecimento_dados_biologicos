@@ -1,0 +1,41 @@
+Universidade do Minho - Mestrado em Bioinformática
+Unidade curricular de Extração	de	Conhecimento	de	Dados	Biológicos
+
+Trabalho	prático n.º 1
+
+Grupo nº6 constituido por:
+Alice Picas PG59750, 
+Eduarda Santos PG58815, 
+Pedro Vieira PG59764, 
+Pedro Fontão PG59429
+
+Constituição do Repositório:
+/ 
+├── README.md                
+├── trabalho_ex_f1.Rmd        
+├── trabalho_ex_f1.html      
+
+Dados:
+Devido ao limite de tamanho do GitHub, os ficheiros de dados não foram carregados diretamente para este repositório. 
+Os dados necessários para executar a análise podem ser descarregados aqui:
+https://drive.google.com/drive/folders/1O3IDmp0zX8ixIpy_FxCFYTiE_Z2NgnIs?usp=drive_link
+
+Software:
+Este trabalho foi realizado no Rstudio
+
+Pacotes necessarios:
+msigdbr
+BiocManager
+
+Librarias necessarias:
+library(TCGAbiolinks)
+library(edgeR)
+library(SummarizedExperiment)
+library(ggplot2)
+library(pheatmap)
+library(DESeq2)
+library(RColorBrewer)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(fgsea)
+library(msigdbr)
