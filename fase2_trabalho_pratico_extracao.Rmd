@@ -1,0 +1,679 @@
+---
+title: "Fase2_TP_extração"
+author: "Eduarda Santos"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Trabalho pratico de Extração	de	Conhecimento	de	Dados	Biológicos - Fase 2
+
+Trabalho realisado por:
+
+  Alice Picas PG59750, 
+  Eduarda Santos PG58815,
+  Pedro Fontão PG59429,
+  Pedro Vieira PG59764 
+
+## Instalação e Carregamento dos Packages
+
+```{r Instalação de Packages}
+#install.packages(c("MASS", "Rtsne", "uwot", "ggplot2", "RColorBrewer", "pheatmap"))
+
+
+# if (!requireNamespace("SummarizedExperiment", quietly = TRUE)) 
+#   BiocManager::install("SummarizedExperiment")
+```
+
+```{r Carregar bibliotecas}
+library(SummarizedExperiment)
+library(pheatmap)
+library(MASS)
+library(Rtsne)
+library(uwot)
+library(ggplot2)
+library(RColorBrewer)
+```
+
+## Carregamento dos Dados Pré-processados
+
+```{r Carregamento dos Dados}
+
+# Carregar a matriz
+logcounts_scaled <- read.csv("logcounts_scaled.csv", row.names = 1, check.names = FALSE)
+
+# Carregar os metadados clínicos
+data_tcga <- readRDS("data_tcga_brca_300.rds")
+clinical <- as.data.frame(colData(data_tcga))
+
+# Alinhar amostras
+clinical <- clinical[colnames(logcounts_scaled), ]
+
+# Verificação
+cat("Dimensões expressão:", dim(logcounts_scaled), "\n")
+cat("Dimensões clinical:", dim(clinical), "\n")
+
+table(clinical$sample_type)
+```
+
+## Clustering de genes e/ou amostras
+
+Nesta secção são aplicados métodos de clustering não supervisionado para identificar agrupamentos naturais entre amostras e explorar padrões presentes nos dados de expressão génica.
+
+## Clustering Hierárquico das Amostras
+
+O clustering hierárquico foi utilizado para explorar relações de similaridade entre amostras e identificar padrões de agrupamento nos dados de expressão génica.
+
+```{r Clustering hierárquico}
+# Calcular a matriz de distâncias (Euclidiana) entre as amostras
+dist_amostras <- dist(t(logcounts_scaled), method = "euclidean")
+
+# Aplicar o algoritmo hierárquico
+hc_amostras <- hclust(dist_amostras, method = "complete")
+
+# Dendrograma global
+plot(hc_amostras,
+     main = "Dendrograma das Amostras (Complete Linkage)",
+     xlab = "Amostras",
+     sub = "Distância Euclidiana",
+     cex = 0.4)
+```
+
+### Heatmap Duplo (Clustering Hierárquico Visual) 
+
+```{r Seleção de genes mais variáveis - heatmap}
+# Variância dos genes
+gene_vars <- apply(logcounts_scaled, 1, var)
+
+# Top 100 genes mais variáveis
+top_100_genes <- names(sort(gene_vars, decreasing = TRUE))[1:100]
+
+# Submatriz
+matriz_top <- logcounts_scaled[top_100_genes, ]
+```
+
+```{r Anotações das amostras}
+# Anotação das amostras
+anotacao_col <- data.frame(
+  Tipo_Amostra = clinical$sample_type
+)
+
+rownames(anotacao_col) <- rownames(clinical)
+
+# Cores
+cores_anotacao <- list(
+  Tipo_Amostra = c(
+    "Primary Tumor" = "#e74c3c",
+    "Solid Tissue Normal" = "#3498db"
+  )
+)
+```
+
+```{r Heatmap}
+pheatmap(matriz_top,
+         scale = "none",
+         annotation_col = anotacao_col,
+         annotation_colors = cores_anotacao,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         clustering_method = "complete",
+         main = "Heatmap com Clustering Hierárquico (Top 100 Genes Variáveis)")
+```
+
+## K-means Clustering das Amostras
+
+O K-means clustering foi utilizado para agrupar amostras com perfis de expressão génica semelhantes, permitindo explorar padrões de separação nos dados. 
+
+### Preparação dos dados
+
+```{r Preparação dos dados}
+# Alinhamento dos dados
+exp <- t(logcounts_scaled)
+clinical2 <- clinical[colnames(logcounts_scaled), ]
+sample_types <- as.factor(clinical2$sample_type)
+
+cat("Dimensões expressão (amostras x genes):", dim(exp), "\n")
+cat("Distribuição dos tipos clínicos:\n")
+print(table(sample_types))
+```
+
+### K-means clustering
+
+```{r K-means clustering}
+set.seed(42)
+k <- 3
+
+km_samples <- kmeans(exp, centers = k, nstart = 50)
+
+cat("Tamanho dos clusters:\n")
+print(km_samples$size)
+
+cat("\nTabela cluster vs tipo clínico:\n")
+print(table(Cluster = km_samples$cluster,
+            Tipo = sample_types))
+```
+
+### Método do cotovelo (WSS)
+
+```{r Seleção de genes mais variáveis - kmeans}
+exp_small <- exp[, order(apply(exp, 2, var), decreasing = TRUE)[1:1000]]
+```
+
+```{r Cálculo WSS}
+wss <- c()
+set.seed(42)
+
+for (k in 2:15) {
+  wss[k] <- kmeans(exp_small, centers = k, nstart = 10, iter.max = 50)$tot.withinss
+}
+```
+
+```{r Plot do cotovelo}
+plot(2:15, wss[2:15], type = "b",
+     xlab = "Número de clusters (k)",
+     ylab = "WSS",
+     main = "Método do cotovelo (K-means)")
+```
+
+### Visualização dos clusters (PCA)
+
+```{r kmeans-pca}
+pca <- prcomp(exp, scale. = TRUE)
+
+plot(pca$x[,1], pca$x[,2],
+     col = km_samples$cluster,
+     pch = 19, cex = 1.2,
+     xlab = "PC1", ylab = "PC2",
+     main = "K-means (k=3) visualizado por PCA")
+
+points(km_samples$centers %*% pca$rotation[,1:2],
+       col = 1:k,
+       pch = 4,
+       cex = 3,
+       lwd = 3)
+
+legend("topright",
+       legend = paste("Cluster", 1:3),
+       col = 1:3,
+       pch = 19)
+```
+
+```{r Genes mais representativos por cluster}
+cluster_means <- sapply(split(as.data.frame(exp), km_samples$cluster), colMeans)
+cluster_means <- t(cluster_means)
+
+cat("Top resultados (primeiros genes):\n")
+print(head(cluster_means[, 1:5]))
+```
+
+
+# Redução	de	dimensionalidade,	MDS	ou	outras	análises	não Supervisionadas
+
+Foram utilizadas técnicas de redução de dimensionalidade e métodos não supervisionados para visualizar a estrutura global dos dados e identificar padrões de agrupamento entre amostras.
+
+## Preparação para Redução de Dimensionalidade
+
+```{r Construção da matrix}
+exp_t <- t(logcounts_scaled)
+
+cat("Dimensões após transposta (amostras x genes):", dim(exp_t), "\n")
+```
+
+```{r Seleção de genes mais variáveis - }
+# Top 1000 genes mais variáveis
+var_genes <- apply(logcounts_scaled, 1, var)
+top_genes <- names(sort(var_genes, decreasing = TRUE))[1:1000]
+
+exp_top <- t(logcounts_scaled[top_genes, ])
+
+cat("Dimensões com top 1000 genes:", dim(exp_top), "\n")
+```
+
+```{r Standardização}
+# Standardizar os dados (recomendado antes de PCA/MDS)
+exp_sc <- scale(exp_top)
+```
+
+```{r Cores para visualização}
+## Alinhamento com dados clínicos
+
+# Alinhar com a matriz de expressão
+clinical2 <- clinical[colnames(logcounts_scaled), ]
+
+# Variáveis clínicas
+sample_types <- factor(clinical2$sample_type)
+tumor_types  <- factor(clinical2$classification_of_tumor)
+
+# Verificação da distribuição
+cat("\nDistribuição dos tipos de amostra:\n")
+print(table(sample_types))
+
+cat("\nDistribuição da classificação do tumor:\n")
+print(table(tumor_types))
+
+# Cores para visualização
+cores <- rainbow(nlevels(sample_types))
+mcols <- cores[as.integer(sample_types)]
+
+cores_tumor_types <- rainbow(nlevels(tumor_types))
+```
+
+
+## PCA
+
+```{r execução PCA}
+# PCA nos dados standardizados 
+pca <- prcomp(exp_sc, scale. = TRUE)
+# Variância explicada por cada componente
+summary(pca)
+```
+
+```{r PCA loadings}
+# PCA loadings (contribuição dos genes para cada componente)
+loadings <- pca$rotation
+
+cat("Genes mais influentes \n\n")
+
+cat("Genes PC1:\n")
+top_pc1 <- head(sort(abs(loadings[,1]), decreasing = TRUE), 10)
+print(top_pc1)
+
+cat("\nGenes PC2:\n")
+top_pc2 <- head(sort(abs(loadings[,2]), decreasing = TRUE), 10)
+print(top_pc2)
+```
+
+```{r Variância explicada}
+# Variância explicada por componente principal
+var_exp <- summary(pca)$importance[2, ]
+
+cat("Variância explicada (PCA)\n\n")
+
+cat("PC1:", round(var_exp[1] * 100, 2), "%\n")
+cat("PC2:", round(var_exp[2] * 100, 2), "%\n")
+cat("PC3:", round(var_exp[3] * 100, 2), "%\n")
+cat("PC4:", round(var_exp[4] * 100, 2), "%\n")
+cat("PC5:", round(var_exp[5] * 100, 2), "%\n")
+```
+
+```{r plot}
+# Scree plot - variância explicada por componente
+plot(pca,
+     type = "l",
+     main = "Scree plot - PCA",
+     )
+```
+
+
+### Sample Type
+A coloração dos pontos é baseada no tipo de amostra (sample_type), permitindo distinguir entre diferentes origens biológicas das amostras.
+
+```{r Sample_Type PC1 vs PC2}
+plot(pca$x[,1], pca$x[,2],
+     col = mcols,
+     pch = 19,
+     cex  = 0.6,
+     xlab = "PC1",
+     ylab = "PC2",
+     main = "PCA - Sample Type")
+legend("topright",
+       legend = levels(sample_types),
+       col = cores,
+       pch = 19,
+       cex = 0.6)
+```
+
+```{r Sample_Type PC1 vs PC3}
+plot(pca$x[,1], pca$x[,3],
+     col = mcols,
+     pch = 19,
+     cex  = 0.6,
+     xlab = "PC1",
+     ylab = "PC3",
+     main = "PCA - Sample Type")
+legend("topleft",
+       legend = levels(sample_types),
+       col = cores,
+       pch = 19,
+       cex = 0.6)
+```
+
+```{r Sample_Type PC2 vs PC3}
+plot(pca$x[,2], pca$x[,3],
+     col = mcols,
+     pch = 19,
+     cex  = 0.6,
+     xlab = "PC2",
+     ylab = "PC3",
+     main = "PCA - Sample Type")
+legend("topright",
+       legend = levels(sample_types),
+       col = cores,
+       pch = 19,
+       cex = 0.6)
+```
+
+```{r Sample_Type PC3 vs PC5}
+plot(pca$x[,3], pca$x[,5],
+     col = mcols,
+     pch = 19,
+     cex  = 0.6,
+     xlab = "PC3",
+     ylab = "PC5",
+     main = "PCA - Sample Type")
+legend("bottomright",
+       legend = levels(sample_types),
+       col = cores,
+       pch = 19)
+```
+
+### Classificação do tumor
+A coloração dos pontos é baseada na classificação clínica do tumor (classification_of_tumor), permitindo avaliar a separação entre subtipos tumorais.
+
+```{r classification_of_tumor PC1 vs PC2}
+plot(pca$x[,1], pca$x[,2],
+     col = as.numeric(tumor_types),
+     pch = 19,
+     cex  = 0.6,
+     xlab = "PC1",
+     ylab = "PC2",
+     main = "PCA - Tumor definition")
+legend("topleft",
+       legend = levels(tumor_types),
+       col = cores_tumor_types,
+       pch = 19,
+       cex = 0.6)
+```
+
+```{r classification_of_tumor PC1 vs PC3}
+plot(pca$x[,1], pca$x[,3],
+     col = as.numeric(tumor_types),
+     pch = 19,
+     cex  = 0.6,
+     xlab = "PC1",
+     ylab = "PC3",
+     main = "PCA - Tumor definition")
+legend("topleft",
+       legend = levels(tumor_types),
+       col = cores_tumor_types,
+       pch = 19,
+       cex = 0.6)
+```
+
+```{r classification_of_tumor PC2 vs PC3}
+plot(pca$x[,2], pca$x[,3],
+     col = as.numeric(tumor_types),
+     pch = 19,
+     cex  = 0.6,
+     xlab = "PC2",
+     ylab = "PC3",
+     main = "PCA - Tumor definition")
+legend("topright",
+       legend = levels(tumor_types),
+       col = cores_tumor_types,
+       pch = 19,
+       cex = 0.6)
+```
+
+```{r PC3 vs PC5}
+plot(pca$x[,3], pca$x[,5],
+     col = as.numeric(tumor_types),
+     pch = 19,
+     cex  = 0.6,
+     xlab = "PC3",
+     ylab = "PC5",
+     main = "PCA - Tumor definition")
+legend("bottomleft",
+       legend = levels(tumor_types),
+       col = cores_tumor_types,
+       pch = 19,
+       cex = 0.6)
+```
+
+
+## MDS Classico (Metrico)
+
+```{r Calcular matriz}
+# Calcular matriz de distancias euclidianas
+dist_mat <- dist(exp_sc, method = "euclidean")
+```
+
+```{r  Correr MDS classico}
+# Correr MDS classico (cmdscale)
+cmd_mds <- cmdscale(dist_mat, k = 3, eig = TRUE)
+```
+
+```{r Variancia}
+# Eigenvalues
+eig <- cmd_mds$eig
+var_exp <- eig / sum(abs(eig)) * 100
+
+# Proporcao de variancia explicada por cada coordenada
+var_c1 <- cmd_mds$eig[2] / sum(abs(cmd_mds$eig)) * 100
+var_c2 <- cmd_mds$eig[3] / sum(abs(cmd_mds$eig)) * 100
+var_c3 <- cmd_mds$eig[4] / sum(abs(cmd_mds$eig)) * 100
+
+lab_c1 <- paste0("Coordinate 1 (", round(var_c1, 2), "%)")
+lab_c2 <- paste0("Coordinate 2 (", round(var_c2, 2), "%)")
+lab_c3 <- paste0("Coordinate 3 (", round(var_c3, 2), "%)")
+
+cat("Variancia explicada:\n")
+cat("  Coordenada 1:", round(var_c1, 2), "%\n")
+cat("  Coordenada 2:", round(var_c2, 2), "%\n")
+cat("  Coordenada 3:", round(var_c3, 2), "%\n")
+```
+
+```{r Visualização do MDS}
+
+# Grafico MDS classico 2D
+plot(cmd_mds$points[, c(1, 2)],
+     xlab = lab_c1, ylab = lab_c2,
+     col  = mcols, pch = 19, cex = 0.8,
+     main = "MDS Classico (Metrico) - TCGA-BRCA")
+legend("topright",
+       legend = levels(sample_types),
+       col    = cores,
+       pch    = 19, cex = 0.6)
+
+```
+
+
+## MDS Nao Metrico
+
+```{r Preparação da matriz de distâncias}
+# Evitar distâncias zero (necessário para isoMDS)
+dist_mat2 <- dist_mat
+dist_mat2[dist_mat2 == 0] <- 0.00001
+```
+
+```{r Correr isoMDS}
+# Correr isoMDS
+set.seed(42)
+
+ord <- isoMDS(dist_mat2, k = 2)
+
+cat("Stress do MDS não métrico:", round(ord$stress, 2), "\n")
+```
+
+```{r Grafico}
+plot(ord$points[, c(1, 2)],
+     xlab = "Coordenada 1",
+     ylab = "Coordenada 2",
+     col  = mcols,
+     pch = 19,
+     cex = 0.8,
+     main = "MDS Não Métrico (isoMDS) - TCGA-BRCA")
+legend("topright",
+       legend = levels(sample_types),
+       col    = cores,
+       pch    = 19,
+       cex = 0.6)
+```
+
+
+## t-SNE
+
+```{r Remoção de duplicados}
+# Remover duplicados (necessário para Rtsne)
+exp_nd   <- exp_sc[!duplicated(exp_sc), ]
+mcols_nd <- mcols[!duplicated(exp_sc)]
+sample_types_nd <- sample_types[!duplicated(exp_sc)]
+
+cat("Amostras após remoção de duplicados:", nrow(exp_nd), "\n")
+```
+
+```{r Execução do t-SNE}
+set.seed(42)
+
+res_tsne <- Rtsne(exp_nd,
+                  dims = 2,
+                  perplexity = 30,
+                  max_iter = 1000,
+                  check_duplicates = FALSE)
+```
+
+```{r Visualização t-SNE}
+plot(res_tsne$Y,
+     col  = mcols_nd,
+     pch  = 19,
+     cex  = 0.8,
+     xlab = "tSNE1",
+     ylab = "tSNE2",
+     main = "t-SNE - TCGA-BRCA")
+legend("topright",
+       legend = levels(sample_types_nd),
+       col    = cores,
+       pch    = 19,
+       cex    = 0.6)
+```
+
+```{r Visualização t-SNE com ggplot2}
+tsne_df <- data.frame(
+  tSNE1 = res_tsne$Y[, 1],
+  tSNE2 = res_tsne$Y[, 2],
+  sample_type = sample_types_nd
+)
+
+ggplot(tsne_df, aes(x = tSNE1, y = tSNE2, color = sample_type)) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "t-SNE - TCGA-BRCA",
+       color = "Estadio AJCC")
+```
+
+
+## UMAP
+
+```{r Execução do UMAP}
+set.seed(42)
+
+umap_result <- umap(exp_nd,
+                    n_neighbors = 15,
+                    min_dist = 0.1,
+                    metric = "euclidean")
+```
+
+```{r Visualização UMAP}
+plot(umap_result[, 1], umap_result[, 2],
+     col  = mcols_nd,
+     pch  = 19,
+     cex  = 0.8,
+     xlab = "UMAP1",
+     ylab = "UMAP2",
+     main = "UMAP - TCGA-BRCA")
+legend("topright",
+       legend = levels(sample_types_nd),
+       col    = cores,
+       pch    = 19,
+       cex    = 0.6)
+```
+
+```{r Visualização UMAP com ggplot2}
+umap_df <- data.frame(
+  UMAP1 = umap_result[, 1],
+  UMAP2 = umap_result[, 2],
+  sample_type = sample_types_nd
+)
+
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = sample_type)) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "UMAP - TCGA-BRCA",
+       color = "Estadio AJCC")
+```
+
+## Comparacao dos Metodos
+
+```{r comparacao, fig.width=15, fig.height=5}
+par(mfrow = c(1, 4))
+
+#PCA
+plot(pca$x[,1], pca$x[,2],
+     col = mcols,
+     pch = 19,
+     cex  = 0.6,
+     xlab = "PC1",
+     ylab = "PC2",
+     main = "PCA")
+
+# MDS clássico
+plot(cmd_mds$points[, c(1, 2)],
+     col  = mcols,
+     pch  = 19,
+     cex  = 0.7,
+     xlab = lab_c1,
+     ylab = lab_c2,
+     main = "MDS Clássico")
+
+# t-SNE
+plot(res_tsne$Y,
+     col  = mcols_nd,
+     pch  = 19,
+     cex  = 0.7,
+     xlab = "tSNE1",
+     ylab = "tSNE2",
+     main = "t-SNE")
+
+# UMAP
+plot(umap_result[, 1], umap_result[, 2],
+     col  = mcols_nd,
+     pch  = 19,
+     cex  = 0.7,
+     xlab = "UMAP1",
+     ylab = "UMAP2",
+     main = "UMAP")
+
+par(mfrow = c(1, 1))
+```
+
+## Exportar Resultados
+
+```{r exportar}
+# PCA
+if (exists("pca")) {
+  write.csv(as.data.frame(pca$x), file = "pca_coordenadas.csv")
+  cat("pca_coordenadas.csv exportado\n")
+}
+
+# MDS
+if (exists("cmd_mds")) {
+  write.csv(as.data.frame(cmd_mds$points), file = "mds_coordenadas.csv")
+  cat("mds_coordenadas.csv exportado\n")
+}
+
+# t-SNE
+if (exists("res_tsne")) {
+  write.csv(as.data.frame(res_tsne$Y), file = "tsne_coordenadas.csv")
+  cat("tsne_coordenadas.csv exportado\n")
+}
+
+# UMAP
+if (exists("umap_result")) {
+  write.csv(as.data.frame(umap_result), file = "umap_coordenadas.csv")
+  cat("umap_coordenadas.csv exportado\n")
+}
+```
+
