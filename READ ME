@@ -18,6 +18,8 @@ Constituição do Repositório:
 |--- counts_filtered.csv           
 |--- logcounts_normalized.zip     
 |--- logcounts_scaled.zip  
+|--- fase2_trabalho_pratico_extracao.html
+|--- fase2_trabalho_pratico_extracao.Rmd
 
 Software:
 Este trabalho foi realizado no Rstudio
@@ -38,3 +40,7 @@ library(org.Hs.eg.db)
 library(AnnotationDbi)
 library(fgsea)
 library(msigdbr)
+library(MASS)
+library(Rtsne)
+library(uwot)
+
