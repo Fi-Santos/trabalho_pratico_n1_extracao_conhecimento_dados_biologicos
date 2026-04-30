@@ -1,0 +1,550 @@
+title: "Parte3_extracao_modelo1"
+author: "Pedro Fontão"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: flatly
+---
+
+#Trabalho pratico de Extração	de	Conhecimento	de	Dados	Biológicos - Fase 3
+
+Trabalho realizado por:
+
+  Alice Picas PG59750, 
+  Eduarda Santos PG58815,
+  Pedro Fontão PG59429,
+  Pedro Vieira PG59764 
+
+# Instalação e Carregamento de Packages
+
+```{r setup, message=FALSE, warning=FALSE}
+# Instalar (correr apenas uma vez)
+#install.packages(c("randomForest", "caret", "pROC", "ggplot2", "RColorBrewer"))
+
+library(randomForest)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(RColorBrewer)
+library(glmnet)
+library(reshape2)
+library(pheatmap)
+```
+
+---
+
+# Carregar Dados Pré-processados
+
+```{r carregar-dados}
+logcounts <- read.csv("logcounts_normalized.csv", row.names = 1)
+clinical  <- read.csv("clinical_processed.csv",   row.names = 1)
+
+cat("Dimensoes logcounts:", dim(logcounts), "\n")
+```
+
+
+# Preparação dos Dados para Classificação
+
+```{r preparacao}
+# Transpor: amostras nas linhas, genes nas colunas
+exp_t <- as.data.frame(t(logcounts))
+
+# Extrair tipo de amostra (tumor vs normal) a partir dos nomes das amostras
+# No TCGA: codigo de amostra com -01 = tumor primario, -11 = normal
+sample_codes <- substr(rownames(exp_t), 14, 15)
+labels       <- ifelse(sample_codes == "11", "Normal", "Tumor")
+labels       <- factor(labels, levels = c("Normal", "Tumor"))
+
+cat("Distribuicao das classes:\n")
+print(table(labels))
+
+# Usar apenas top 500 genes mais variaveis (reduz custo computacional)
+var_genes <- apply(exp_t, 2, var)
+top500    <- names(sort(var_genes, decreasing = TRUE))[1:500]
+exp_top   <- exp_t[, top500]
+
+# Adicionar variavel resposta
+exp_top$label <- labels
+
+cat("\nDimensoes finais do dataset:", dim(exp_top), "\n")
+```
+
+
+# Divisão Treino / Teste (70% / 30%)
+
+```{r split}
+set.seed(42)
+train_idx <- createDataPartition(exp_top$label, p = 0.70, list = FALSE)
+train_data <- exp_top[train_idx, ]
+test_data  <- exp_top[-train_idx, ]
+
+cat("Amostras de treino:", nrow(train_data), "\n")
+cat("Amostras de teste: ", nrow(test_data),  "\n")
+cat("\nDistribuicao treino:\n")
+print(table(train_data$label))
+cat("\nDistribuicao teste:\n")
+print(table(test_data$label))
+```
+
+
+
+# Treino do Modelo Random Forest
+
+```{r treino_RandomForest}
+set.seed(42)
+
+# Treinar Random Forest
+# ntree = 500 arvores; importance = TRUE para calcular importancia dos genes
+rf_model <- randomForest(
+  label    ~ .,
+  data      = train_data,
+  ntree     = 500,
+  mtry      = floor(sqrt(500)),  # nº de genes testados em cada split
+  importance = TRUE,
+  do.trace  = FALSE
+)
+
+print(rf_model)
+
+# Erro OOB (out-of-bag) por numero de arvores
+plot(rf_model,
+     main = "Erro OOB por Numero de Arvores",
+     col  = c("black", "red", "blue"))
+legend("topright",
+       legend = c("OOB", "Normal", "Tumor"),
+       col    = c("black", "red", "blue"),
+       lty    = 1)
+```
+
+## Avaliação do Modelo Random Forest no Conjunto de Teste 
+
+```{r avaliacao_RandomForest}
+# Predicoes
+rf_pred_class <- predict(rf_model, newdata = test_data, type = "class")
+rf_pred_prob  <- predict(rf_model, newdata = test_data, type = "prob")[, "Tumor"]
+
+# Matriz de confusao
+rf_cm <- confusionMatrix(rf_pred_class, test_data$label, positive = "Tumor")
+print(rf_cm)
+
+# Extrair metricas principais
+rf_accuracy  <- rf_cm$overall["Accuracy"]
+rf_precision <- rf_cm$byClass["Precision"]
+rf_recall    <- rf_cm$byClass["Recall"]         # = Sensitivity
+rf_f1        <- rf_cm$byClass["F1"]
+rf_specificity <- rf_cm$byClass["Specificity"]
+
+cat("\n=== METRICAS DE DESEMPENHO - RANDOM FOREST ===\n")
+cat("Accuracy:   ", round(rf_accuracy,    4), "\n")
+cat("Precision:  ", round(rf_precision,   4), "\n")
+cat("Recall:     ", round(rf_recall,      4), "\n")
+cat("F1-Score:   ", round(rf_f1,          4), "\n")
+cat("Specificity:", round(rf_specificity, 4), "\n")
+```
+
+## Curva ROC e AUC
+
+```{r roc_Random_Forest}
+rf_roc_obj <- roc(test_data$label, rf_pred_prob,
+               levels  = c("Normal", "Tumor"),
+               direction = "<")
+
+rf_auc_val <- auc(rf_roc_obj)
+cat("AUC:", round(rf_auc_val, 4), "\n")
+
+# Grafico ROC
+plot(rf_roc_obj,
+     col  = "steelblue", lwd = 2,
+     main = paste0("Curva ROC - Random Forest (AUC = ", round(rf_auc_val, 3), ")"),
+     print.auc = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "grey50")
+```
+
+## Importância dos Genes
+
+```{r importancia-genes_RandomForest}
+# Extrair importancia dos genes
+rf_imp <- importance(rf_model)
+rf_imp_df <- data.frame(
+  gene          = rownames(rf_imp),
+  MeanDecreaseAccuracy = rf_imp[, "MeanDecreaseAccuracy"],
+  MeanDecreaseGini     = rf_imp[, "MeanDecreaseGini"]
+)
+
+# Ordenar por MeanDecreaseAccuracy
+rf_imp_df <- rf_imp_df[order(rf_imp_df$MeanDecreaseAccuracy, decreasing = TRUE), ]
+
+cat("Top 20 genes mais importantes:\n")
+print(head(rf_imp_df, 20))
+
+# Grafico top 20 genes - MeanDecreaseAccuracy
+rf_top20_imp <- head(rf_imp_df, 20)
+
+ggplot(rf_top20_imp,
+       aes(x = reorder(gene, MeanDecreaseAccuracy),
+           y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top 20 Genes Mais Importantes - Random Forest",
+       x     = "Gene",
+       y     = "Mean Decrease Accuracy")
+
+# Grafico varImpPlot nativo do randomForest
+varImpPlot(rf_model,
+           n.var = 20,
+           main  = "Importancia dos Genes - Top 20",
+           col   = "steelblue")
+```
+
+
+```{r cross-validation_RandomForest}
+set.seed(42)
+
+# Configurar CV com caret
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+# Treinar com CV (usar menos arvores para ser mais rapido)
+rf_cv <- train(
+  label ~ .,
+  data      = exp_top,
+  method    = "rf",
+  metric    = "ROC",
+  trControl = ctrl,
+  ntree     = 200,
+  tuneGrid  = data.frame(mtry = floor(sqrt(500)))
+)
+
+print(rf_cv)
+cat("\nAUC media (5-fold CV):", round(rf_cv$results$ROC, 4), "\n")
+cat("Sensibilidade media:  ", round(rf_cv$results$Sens, 4), "\n")
+cat("Especificidade media: ", round(rf_cv$results$Spec, 4), "\n")
+```
+
+## Guardar Resultados para Comparação com Modelo 2
+
+```{r exportar_RandomForest}
+# Guardar metricas para o colega poder comparar com o Modelo 2
+metricas_rf <- data.frame(
+  Modelo      = "Random Forest",
+  Accuracy    = round(as.numeric(rf_accuracy),    4),
+  Precision   = round(as.numeric(rf_precision),   4),
+  Recall      = round(as.numeric(rf_recall),      4),
+  F1          = round(as.numeric(rf_f1),          4),
+  Specificity = round(as.numeric(rf_specificity), 4),
+  AUC         = round(as.numeric(rf_auc_val),     4),
+  AUC_CV      = round(rf_cv$results$ROC,       4)
+)
+
+write.csv(metricas_rf,        file = "metricas_modelo1_rf.csv",       row.names = FALSE)
+write.csv(rf_imp_df,             file = "importancia_genes_rf.csv",      row.names = FALSE)
+write.csv(as.data.frame(rf_pred_prob), file = "predicoes_rf.csv",        row.names = TRUE)
+
+cat("Ficheiros exportados com sucesso.\n")
+print(metricas_rf)
+```
+
+
+
+# Treino do Modelo Regressão Logistica
+
+```{r treino_RegressãoLogistica}
+#treinar o modelo de regressão logistica
+rl_model <- glm(
+  label ~ .,
+  data   = train_data,
+  family = binomial,
+  control = list(maxit = 100)
+)
+
+summary(rl_model)
+
+```
+
+## Avaliação do Modelo Regressão Logistica no Conjunto de Teste
+
+```{r avaliacao_RegressãoLogistica}
+# Predicoes
+rl_pred_prob <- predict(rl_model, newdata = test_data, type = "response")
+rl_pred_class <- ifelse(rl_pred_prob > 0.5, "Tumor", "Normal")
+rl_pred_class <- factor(rl_pred_class, levels = c("Normal", "Tumor"))
+
+# Matriz de confusao
+rl_cm <- confusionMatrix(rl_pred_class, test_data$label, positive = "Tumor")
+print(rl_cm)
+
+rl_accuracy     <- rl_cm$overall["Accuracy"]
+rl_precision    <- rl_cm$byClass["Precision"]
+rl_recall       <- rl_cm$byClass["Recall"]
+rl_f1           <- rl_cm$byClass["F1"]
+rl_specificity  <- rl_cm$byClass["Specificity"]
+
+cat("\n=== METRICAS DE DESEMPENHO - REGRESSAO LOGISTICA ===\n")
+cat("Accuracy:   ", round(rl_accuracy,    4), "\n")
+cat("Precision:  ", round(rl_precision,   4), "\n")
+cat("Recall:     ", round(rl_recall,      4), "\n")
+cat("F1-Score:   ", round(rl_f1,          4), "\n")
+cat("Specificity:", round(rl_specificity, 4), "\n")
+```
+
+## Curva ROC e AUC
+
+```{r roc_RegressãoLogistica}
+rl_roc_obj <- roc(test_data$label, rl_pred_prob,
+               levels  = c("Normal", "Tumor"),
+               direction = "<")
+
+rl_auc_val <- auc(rl_roc_obj)
+cat("AUC:", round(rl_auc_val, 4), "\n")
+
+# Grafico ROC
+plot(rl_roc_obj,
+     col  = "steelblue", lwd = 2,
+     main = paste0("Curva ROC - Regressão Logistica (AUC = ", round(rl_auc_val, 3), ")"),
+     print.auc = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "grey50")
+```
+
+## Importância dos Genes
+
+```{r importancia-genes_RegressãoLogistica}
+# Extrair coeficientes do modelo
+rl_coef <- summary(rl_model)$coefficients
+
+# Criar dataframe de importância
+rl_imp <- data.frame(
+  gene = rownames(rl_coef),
+  Estimate = rl_coef[, "Estimate"],
+  P_value = rl_coef[, "Pr(>|z|)"]
+)
+
+# Remover intercepto
+rl_imp <- rl_imp[-1, ]
+
+# Criar métrica de importância
+rl_imp$Importance <- abs(rl_imp$Estimate)
+
+# Ordenar por importância
+rl_imp <- rl_imp[order(rl_imp$Importance, decreasing = TRUE), ]
+
+# Top 20 genes
+rl_top20_imp <- head(rl_imp, 20)
+
+cat("Top 20 genes mais importantes:\n")
+print(rl_top20_imp)
+
+ggplot(rl_top20_imp,
+       aes(x = reorder(gene, Importance),
+           y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Importância dos Genes - Regressão Logística",
+    x = "Gene",
+    y = "Importance"
+  )
+```
+
+
+## Validação Cruzada (5-fold Cross-Validation)
+
+```{r cross-validation_RegressãoLogistica}
+set.seed(42)
+
+# Configuração da validação cruzada
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+# Garantir classe positiva correta
+exp_top$label <- relevel(exp_top$label, ref = "Normal")
+
+# Treino do modelo com validação cruzada
+rl_cv <- train(
+  label ~ .,
+  data      = exp_top,
+  method    = "glm",
+  family    = binomial,
+  metric    = "ROC",
+  trControl = ctrl
+)
+
+# Resultados do modelo
+print(rl_cv)
+
+# Métricas médias (CV)
+cat("\n=== METRICAS MEDIA (5-fold CV) - REGRESSAO LOGISTICA ===\n")
+cat("AUC:          ", round(rl_cv$results$ROC,  4), "\n")
+cat("Sensibilidade:", round(rl_cv$results$Sens, 4), "\n")
+cat("Especificidade:", round(rl_cv$results$Spec, 4), "\n")
+```
+
+
+## Guardar Resultados para Comparação com Modelo 1
+
+```{r exportar_RegressãoLogistica}
+# Guardar métricas para comparação com o Modelo 1 (RF)
+metricas_rl <- data.frame(
+  Modelo      = "Regressao Logistica",
+  Accuracy    = round(as.numeric(rl_accuracy),    4),
+  Precision   = round(as.numeric(rl_precision),   4),
+  Recall      = round(as.numeric(rl_recall),      4),
+  F1          = round(as.numeric(rl_f1),          4),
+  Specificity = round(as.numeric(rl_specificity), 4),
+  AUC         = round(as.numeric(rl_auc_val),     4),
+  AUC_CV      = round(rl_cv$results$ROC,      4)
+)
+
+# Exportar métricas
+write.csv(metricas_rl,
+          file = "metricas_modelo2_rl.csv",
+          row.names = FALSE)
+
+# Exportar importância dos genes
+write.csv(rl_imp,
+          file = "importancia_genes_rl.csv",
+          row.names = FALSE)
+
+# Exportar probabilidades previstas
+write.csv(data.frame(rl_pred_prob),
+          file = "predicoes_rl.csv",
+          row.names = TRUE)
+
+cat("Ficheiros exportados com sucesso.\n")
+print(metricas_rl)
+```
+
+
+
+# Comparação do modelo de Random Forest com o modelo de Regressão logistica  
+
+```{r comparacao-modelos}
+comparacao_modelos <- rbind(metricas_rf, metricas_rl)
+
+print(comparacao_modelos)
+```
+
+```{r comparacao-grafico-modelos}
+# Converter para formato adequado
+comp_long <- melt(comparacao_modelos, id.vars = "Modelo")
+
+# Gráfico comparativo
+ggplot(comp_long, aes(x = variable, y = value, fill = Modelo)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(
+    title = "Comparação Final dos Modelos",
+    x = "Métrica",
+    y = "Valor"
+  )
+```
+
+```{r comparacao-roc-modelos}
+
+# ROC - Random Forest
+rf_roc <- roc(
+  response  = test_data$label,
+  predictor = rf_pred_prob,
+  levels    = c("Normal", "Tumor"),
+  direction = "<"
+)
+
+# ROC - Regressão Logística
+rl_roc <- roc(
+  response  = test_data$label,
+  predictor = rl_pred_prob,
+  levels    = c("Normal", "Tumor"),
+  direction = "<"
+)
+
+# Plot base (Random Forest)
+plot(
+  rf_roc,
+  col  = "darkgreen",
+  lwd  = 2,
+  main = "Curvas ROC: Random Forest vs Regressao Logistica"
+)
+
+# Adicionar Regressão Logística
+plot(
+  rl_roc,
+  col  = "darkred",
+  lwd  = 2,
+  add  = TRUE
+)
+
+# Linha de referência
+abline(a = 0, b = 1, lty = 2, col = "grey")
+
+# Legenda com AUC
+legend(
+  "bottomright",
+  legend = c(
+    paste0("Random Forest (AUC = ", metricas_rf$AUC, ")"),
+    paste0("Regressao Logistica (AUC = ", metricas_rl$AUC, ")")
+  ),
+  col = c("darkgreen", "darkred"),
+  lwd = 2
+)
+```
+
+# Análise dos resultados
+
+```{r expressao-top5-genes}
+
+top5_rf_genes <- c("ENSG00000123500.10", "ENSG00000161649.13", 
+                   "ENSG00000168079.17", "ENSG00000101938.15", 
+                   "ENSG00000065618.21")
+
+
+medias_top5 <- rowMeans(logcounts[top5_rf_genes, ])
+
+
+df_top5_exp <- data.frame(
+  Gene = names(medias_top5),
+  MeanExpression = medias_top5
+)
+
+
+ggplot(df_top5_exp, aes(x = reorder(Gene, MeanExpression), y = MeanExpression)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  ylab("Média de expressão (logcounts)") +
+  xlab("Gene") +
+  ggtitle("Expressão Média dos Top 5 Genes mais importantes (Random Forest)")
+```
+
+```{r heatmap-top5-genes}
+top5_rf_genes <- c("ENSG00000123500.10", "ENSG00000161649.13", 
+                   "ENSG00000168079.17", "ENSG00000101938.15", 
+                   "ENSG00000065618.21")
+
+matriz_heatmap <- t(exp_top[, top5_rf_genes])
+
+anotacao_amostras <- data.frame(Condicao = exp_top$label)
+rownames(anotacao_amostras) <- rownames(exp_top)
+
+pheatmap(matriz_heatmap, 
+         annotation_col = anotacao_amostras,
+         scale = "row", # Escala por gene para ver bem a diferença de cores
+         show_colnames = FALSE, 
+         cluster_cols = TRUE,
+         main = "Expressão dos 5 Principais Genes (Random Forest)")
+```
+
+Na comparação entre o Random Forest e a Regressão Logística, é possível observar que o Random Forest supera o outro modelo em todas as métricas analisadas. O algoritmo identificou os genes ENSG00000123500.10, ENSG00000161649.13, ENSG00000168079.17, ENSG00000101938.15 e ENSG00000065618.21. 
+Quanto à sua expressão, estes genes não são os mais expressos. Comparando aos genes mais expressos, analisados na fase 1, que chegavam aos 13 logcounts, o gene considerado mais importante pelo modelo Random Forest chegou apenas aos 6 logcounts. Apesar desta discrepância, o valor destes genes provém da sua enorme capacidade de distinção entre amostras de tumor e tecido normal, representando um painel de biomarcadores clinicamente relevantes para o carcinoma da mama.
